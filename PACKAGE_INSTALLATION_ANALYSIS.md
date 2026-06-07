@@ -3,6 +3,91 @@
 ## Overview
 This document analyzes package installations (pip) found in the NVIDIA Skills repository. The codebase uses Python package management in two primary contexts: dependency declarations and runtime installations.
 
+## How Installation Works in the skills.sh Flow
+
+### Key distinction: `skills.sh` is a marketplace, not a runtime sandbox
+
+`skills.sh` is the **distribution catalog** where these NVIDIA skills are
+published (alongside [NVIDIA Build](https://build.nvidia.com/skills)). Users
+install skills with the `skills` CLI:
+
+```bash
+npx skills add nvidia/skills
+```
+
+This copies **instruction files only** — `SKILL.md`, `skill_manifest.yaml`,
+`scripts/`, and `references/` — into the agent's skill directory. It does
+**not** install any Python packages, clone upstream repos, or download model
+weights. Per the README: *"You do not need to clone this repo or copy skill
+folders by hand."* The marketplace's job is to ship instructions plus
+capability governance (signing/verification via `nv-agent-root-cert.pem`,
+grouping via `skills.sh.json`).
+
+**pip never runs "inside skills.sh."** Package installation happens later, at
+**skill execution time**, on whatever host machine the agent runs on, when the
+agent follows the SKILL.md instructions.
+
+### The three-layer dependency architecture
+
+Each skill declares dependencies in three coordinated places:
+
+| Layer | File | Role |
+|-------|------|------|
+| **1. Declaration** | `skill_manifest.yaml` (`runtime.side_effects.pip_packages`) | Source-of-truth metadata; a declared "side-effect contract" the governance layer reads to disclose what will be installed/modified *before* you run it |
+| **2. Instruction** | `SKILL.md` | Tells the agent to emit a bash block that runs `pip install` at runtime, fused to the run command |
+| **3. Fulfillment** | `requirements.txt` | The actual pinned package list `pip install -r` resolves against |
+
+The manifest also declares environment impact, e.g.:
+```yaml
+environment:
+  modifies_active_python_environment: true
+  clean_environment_recommended: true
+  recommended_isolation: fresh venv or container for benchmarks
+```
+
+The SKILL.md deliberately fuses install + run because the runtime is assumed to
+be **possibly-fresh and ephemeral** each time (see `nv-generate-mr/SKILL.md`
+line 26: *"the runtime may be a fresh environment without nibabel/MONAI, so
+dropping the install fails with ModuleNotFoundError"*).
+
+### Two installation styles
+
+**Style A — "thin wrapper, install at run"** (medical imaging skills:
+`nv-generate-mr`, `nv-generate-mr-brain`, `nv-segment-ct`, `nv-segment-ctmr`)
+- `git clone` an upstream NVIDIA repo into `.workbench_data/upstreams/`
+- `pip install -r requirements.txt` into the **active environment** just before running
+- Accepts polluting the active env only when the caller chose it; benchmarks should use a fresh venv/container
+
+**Style B — "managed, isolated venv"** (`omniverse-cad-to-simready` preflight)
+- Creates a **dedicated venv** (`{venv_root}/simready-validate`), preferring `uv venv --python 3.12`, falling back to `python -m venv`
+- Installs into *that* venv via `uv pip install` or `python -m pip install --disable-pip-version-check`
+- Has fallback dependency resolution (USD-core failures → USD Exchange SDK)
+- Invoked via a POSIX shell shim `preflight.sh`: `exec "${PYTHON:-python3}" "$SCRIPT_DIR/preflight.py" "$@"`
+
+### Installation lifecycle
+
+```
+skills.sh marketplace
+   │  npx skills add nvidia/skills
+   ▼
+Agent's skill directory  ← only instructions land here (NO pip yet)
+   │  agent loads SKILL.md when a task matches
+   ▼
+Agent emits the documented bash block on the HOST machine
+   │
+   ├─ Style A: pip install -r requirements.txt → active env (or run-chosen venv)
+   └─ Style B: preflight.sh → preflight.py → creates venv → uv/pip install
+   ▼
+Skill's wrapper script runs against the now-satisfied dependencies
+```
+
+### Practical implications
+
+- **Installing a skill is cheap and side-effect-free.** No GPU, torch, or multi-GB downloads at `npx skills add` time — those are deferred to first execution.
+- **The `pip_packages` manifest field is your pre-flight disclosure** of exactly what will be installed and whether the active Python env is modified.
+- **Environments are assumed ephemeral**, which is why every run re-runs `pip install` — fitting sandboxed/containerized agent runtimes.
+- **For reproducible/benchmark runs, prefer isolation** (fresh venv or container); the omniverse skill enforces this by building its own venv.
+
 ## Key Findings
 
 ### 1. Requirements Files
